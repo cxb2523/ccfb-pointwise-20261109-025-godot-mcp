@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { join as pathJoin, resolve as pathResolve } from 'path';
 import {
   PARAMETER_MAPPINGS,
   REVERSE_PARAMETER_MAPPINGS,
@@ -7,6 +8,12 @@ import {
   validatePath,
   createErrorResponse,
   isGodot44OrLater,
+  expandHomePath,
+  resolveUserPath,
+  buildWindowsGodotCandidates,
+  buildMacGodotCandidates,
+  LINUX_GODOT_BINARY_NAMES,
+  buildGodotOperationArgs,
 } from '../src/utils.js';
 
 describe('PARAMETER_MAPPINGS', () => {
@@ -223,5 +230,124 @@ describe('isGodot44OrLater', () => {
   it('handles version strings with extra info', () => {
     expect(isGodot44OrLater('4.4.1.stable')).toBe(true);
     expect(isGodot44OrLater('4.3.2.rc1')).toBe(false);
+  });
+});
+
+describe('expandHomePath / resolveUserPath', () => {
+  it('expands a leading ~ using the injected home directory', () => {
+    expect(expandHomePath('~', '/home/alice')).toBe('/home/alice');
+    expect(expandHomePath('~/Projects/demo', '/home/alice')).toBe(
+      pathJoin('/home/alice', 'Projects/demo')
+    );
+  });
+
+  it('leaves paths without a leading ~ untouched', () => {
+    expect(expandHomePath('/abs/path', '/home/alice')).toBe('/abs/path');
+    expect(expandHomePath('relative/path', '/home/alice')).toBe('relative/path');
+  });
+
+  it('resolveUserPath expands ~ then resolves to an absolute path', () => {
+    const resolved = resolveUserPath('~/MyProject', '/home/alice');
+    expect(resolved).toBe(pathResolve('/home/alice', 'MyProject'));
+  });
+});
+
+describe('Godot executable candidate helpers', () => {
+  it('buildWindowsGodotCandidates appends .exe when missing, leaves it alone otherwise', () => {
+    expect(buildWindowsGodotCandidates('C:\\Games\\Godot\\Godot')).toEqual([
+      'C:\\Games\\Godot\\Godot',
+      'C:\\Games\\Godot\\Godot.exe',
+    ]);
+    expect(buildWindowsGodotCandidates('C:\\Games\\Godot\\Godot.exe')).toEqual([
+      'C:\\Games\\Godot\\Godot.exe',
+    ]);
+  });
+
+  it('buildMacGodotCandidates drills into a .app bundle before falling back to the bare path', () => {
+    expect(buildMacGodotCandidates('/Applications/Godot_4.app')).toEqual([
+      pathJoin('/Applications/Godot_4.app', 'Contents', 'MacOS', 'Godot_4'),
+      pathJoin('/Applications/Godot_4.app', 'Contents', 'MacOS', 'Godot'),
+      '/Applications/Godot_4.app',
+    ]);
+  });
+
+  it('buildMacGodotCandidates passes non-bundle paths through unchanged', () => {
+    expect(buildMacGodotCandidates('/usr/local/bin/godot')).toEqual(['/usr/local/bin/godot']);
+  });
+
+  it('LINUX_GODOT_BINARY_NAMES tries godot4, godot, Godot_v4 in that order', () => {
+    expect(LINUX_GODOT_BINARY_NAMES).toEqual(['godot4', 'godot', 'Godot_v4']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GodotExecutor subprocess argv construction.
+//
+// These two tests are the ones required by the GodotExecutor refactor: they
+// verify the exact array buildGodotOperationArgs() returns is what reaches
+// execFile/spawn as argv - the array a shell would otherwise have mangled by
+// re-tokenizing on spaces or re-interpreting quotes/backslashes.
+// ---------------------------------------------------------------------------
+describe('buildGodotOperationArgs (subprocess argv construction)', () => {
+  it('does not truncate or split a project path containing spaces and Chinese characters', () => {
+    const projectPath = 'D:\\Games\\我的 项目\\test dir';
+    const operationsScriptPath = '/opt/godot-mcp/scripts/godot_operations.gd';
+    const args = buildGodotOperationArgs({
+      projectPath,
+      operationsScriptPath,
+      operation: 'create_scene',
+      paramsJson: '{"scene_path":"main.tscn"}',
+    });
+
+    // The path must survive as a single argv element, byte-for-byte, with no
+    // shell-style re-tokenization on the embedded spaces and no mangling of
+    // the multi-byte Chinese characters.
+    expect(args).toContain(projectPath);
+    const pathIndex = args.indexOf(projectPath);
+    expect(args[pathIndex]).toBe(projectPath);
+    expect(args[pathIndex].length).toBe(projectPath.length);
+    expect(args[pathIndex]).toContain('我的 项目');
+    expect(args[pathIndex]).toContain('test dir');
+
+    // No element should have been split apart at the spaces: the array must
+    // have exactly the 6 expected entries (no debug flag requested here),
+    // not more than that from the path breaking into extra argv elements.
+    expect(args).toEqual([
+      '--headless',
+      '--path',
+      projectPath,
+      '--script',
+      operationsScriptPath,
+      'create_scene',
+      '{"scene_path":"main.tscn"}',
+    ]);
+  });
+
+  it('passes a JSON params string with embedded quotes, backslashes, and newlines through unescaped and round-trippable', () => {
+    const originalParams = {
+      scene_path: 'main.tscn',
+      note: 'He said "hi"\nSecond line with a backslash: C:\\Users\\测试',
+    };
+    const paramsJson = JSON.stringify(originalParams);
+
+    const args = buildGodotOperationArgs({
+      projectPath: '/tmp/project',
+      operationsScriptPath: '/opt/godot-mcp/scripts/godot_operations.gd',
+      operation: 'create_resource',
+      paramsJson,
+    });
+
+    const jsonArg = args[args.length - 1];
+
+    // The argv element must be byte-for-byte identical to the JSON string we
+    // handed in - no extra escaping/unescaping applied by our own code.
+    expect(jsonArg).toBe(paramsJson);
+
+    // And it must parse back to exactly the original object: the quotes,
+    // the newline, and the backslash all round-trip intact.
+    expect(JSON.parse(jsonArg)).toEqual(originalParams);
+    expect(JSON.parse(jsonArg).note).toContain('"hi"');
+    expect(JSON.parse(jsonArg).note).toContain('\n');
+    expect(JSON.parse(jsonArg).note).toContain('C:\\Users\\测试');
   });
 });

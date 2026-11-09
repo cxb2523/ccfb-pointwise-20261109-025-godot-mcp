@@ -40,6 +40,11 @@ import {
   isValidCsharpIdentifier,
   parseGodotScriptDiagnostics,
   collectGdPaths,
+  resolveUserPath,
+  buildWindowsGodotCandidates,
+  buildMacGodotCandidates,
+  LINUX_GODOT_BINARY_NAMES,
+  buildGodotOperationArgs,
   type OperationParams,
 } from './utils.js';
 
@@ -51,7 +56,7 @@ const ALLOWED_PROJECT_ROOTS: string[] = (process.env.GODOT_MCP_ALLOWED_DIRS || '
   .split(process.platform === 'win32' ? /[;,]/ : /[:,]/)
   .map(p => p.trim())
   .filter(p => p.length > 0)
-  .map(p => resolve(p));
+  .map(p => resolveUserPath(p));
 
 const execFileAsync = promisify(execFile);
 
@@ -144,14 +149,16 @@ export class GodotServer {
 
       // Store and validate custom Godot path if provided
       if (config.godotPath) {
-        const normalizedPath = normalize(config.godotPath);
-        this.godotPath = normalizedPath;
-        this.logDebug(`Custom Godot path provided: ${this.godotPath}`);
+        this.logDebug(`Custom Godot path provided: ${config.godotPath}`);
 
-        // Validate immediately with sync check
-        if (!this.isValidGodotPathSync(this.godotPath)) {
-          console.warn(`[SERVER] Invalid custom Godot path provided: ${this.godotPath}`);
-          this.godotPath = null; // Reset to trigger auto-detection later
+        // Expand the platform-specific candidates (Windows .exe suffix,
+        // macOS .app bundle drill-down) and take the first that exists.
+        const candidates = this.candidateGodotPaths(config.godotPath);
+        const match = candidates.find(candidate => this.isValidGodotPathSync(candidate));
+        this.godotPath = match ? normalize(match) : null;
+
+        if (!this.godotPath) {
+          console.warn(`[SERVER] Invalid custom Godot path provided: ${config.godotPath}`);
         }
       }
     }
@@ -217,6 +224,30 @@ export class GodotServer {
   }
 
   /**
+   * Expand a raw Godot path (from config, GODOT_PATH, or auto-detect guesses)
+   * into the platform-specific executable candidates to try, in priority order.
+   * 'godot' is left as a bare command name so PATH lookup still applies.
+   */
+  private candidateGodotPaths(rawPath: string): string[] {
+    if (rawPath === 'godot') return [rawPath];
+    const resolved = resolveUserPath(rawPath);
+    if (process.platform === 'win32') return buildWindowsGodotCandidates(resolved);
+    if (process.platform === 'darwin') return buildMacGodotCandidates(resolved);
+    return [resolved];
+  }
+
+  /**
+   * Resolve a raw Godot path to the first candidate that passes full
+   * (async, --version) validation, or null if none of them work.
+   */
+  private async resolveGodotCandidate(rawPath: string): Promise<string | null> {
+    for (const candidate of this.candidateGodotPaths(rawPath)) {
+      if (await this.isValidGodotPath(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  /**
    * Validate if a Godot path is valid and executable
    */
   private async isValidGodotPath(path: string): Promise<boolean> {
@@ -261,10 +292,10 @@ export class GodotServer {
 
     // Check environment variable next
     if (process.env.GODOT_PATH) {
-      const normalizedPath = normalize(process.env.GODOT_PATH);
-      this.logDebug(`Checking GODOT_PATH environment variable: ${normalizedPath}`);
-      if (await this.isValidGodotPath(normalizedPath)) {
-        this.godotPath = normalizedPath;
+      this.logDebug(`Checking GODOT_PATH environment variable: ${process.env.GODOT_PATH}`);
+      const match = await this.resolveGodotCandidate(process.env.GODOT_PATH);
+      if (match) {
+        this.godotPath = match;
         this.logDebug(`Using Godot path from environment: ${this.godotPath}`);
         return;
       } else {
@@ -276,21 +307,23 @@ export class GodotServer {
     const osPlatform = process.platform;
     this.logDebug(`Auto-detecting Godot path for platform: ${osPlatform}`);
 
-    const possiblePaths: string[] = [
-      'godot', // Check if 'godot' is in PATH first
-    ];
+    const possiblePaths: string[] = [];
 
-    // Add platform-specific paths
+    // Add platform-specific paths. 'godot' (bare PATH lookup) is included
+    // per-platform so the linux priority order (godot4, godot, Godot_v4)
+    // can be expressed exactly rather than being forced first for everyone.
     if (osPlatform === 'darwin') {
       possiblePaths.push(
-        '/Applications/Godot.app/Contents/MacOS/Godot',
-        '/Applications/Godot_4.app/Contents/MacOS/Godot',
-        `${process.env.HOME}/Applications/Godot.app/Contents/MacOS/Godot`,
-        `${process.env.HOME}/Applications/Godot_4.app/Contents/MacOS/Godot`,
-        `${process.env.HOME}/Library/Application Support/Steam/steamapps/common/Godot Engine/Godot.app/Contents/MacOS/Godot`
+        'godot',
+        '/Applications/Godot.app',
+        '/Applications/Godot_4.app',
+        `${process.env.HOME}/Applications/Godot.app`,
+        `${process.env.HOME}/Applications/Godot_4.app`,
+        `${process.env.HOME}/Library/Application Support/Steam/steamapps/common/Godot Engine/Godot.app`
       );
     } else if (osPlatform === 'win32') {
       possiblePaths.push(
+        'godot',
         'C:\\Program Files\\Godot\\Godot.exe',
         'C:\\Program Files (x86)\\Godot\\Godot.exe',
         'C:\\Program Files\\Godot_4\\Godot.exe',
@@ -299,44 +332,40 @@ export class GodotServer {
       );
     } else if (osPlatform === 'linux') {
       possiblePaths.push(
+        'godot4',
+        'godot',
+        'Godot_v4',
         '/usr/bin/godot',
         '/usr/local/bin/godot',
         '/snap/bin/godot',
         `${process.env.HOME}/.local/bin/godot`
       );
+    } else {
+      possiblePaths.push('godot');
     }
 
-    // Try each possible path
+    // Try each possible path, expanding per-platform executable candidates
+    // (Windows .exe suffix, macOS .app bundle drill-down) for each guess.
     for (const path of possiblePaths) {
-      const normalizedPath = normalize(path);
-      if (await this.isValidGodotPath(normalizedPath)) {
-        this.godotPath = normalizedPath;
-        this.logDebug(`Found Godot at: ${normalizedPath}`);
+      const match = await this.resolveGodotCandidate(path);
+      if (match) {
+        this.godotPath = match;
+        this.logDebug(`Found Godot at: ${match}`);
         return;
       }
     }
 
-    // If we get here, we couldn't find Godot
+    // If we get here, we couldn't find Godot. Report a structured error
+    // instead of guessing an unvalidated path: a guessed path that happens to
+    // exist but isn't actually Godot can hang indefinitely waiting on stdin
+    // once spawned with stdio: 'pipe', instead of failing fast.
+    this.godotPath = null;
     this.logDebug(`Warning: Could not find Godot in common locations for ${osPlatform}`);
     console.error(`[SERVER] Could not find Godot in common locations for ${osPlatform}`);
     console.error(`[SERVER] Set GODOT_PATH=/path/to/godot environment variable or pass { godotPath: '/path/to/godot' } in the config to specify the correct path.`);
 
     if (this.strictPathValidation) {
-      // In strict mode, throw an error
       throw new Error(`Could not find a valid Godot executable. Set GODOT_PATH or provide a valid path in config.`);
-    } else {
-      // Fallback to a default path in non-strict mode; this may not be valid and requires user configuration for reliability
-      if (osPlatform === 'win32') {
-        this.godotPath = normalize('C:\\Program Files\\Godot\\Godot.exe');
-      } else if (osPlatform === 'darwin') {
-        this.godotPath = normalize('/Applications/Godot.app/Contents/MacOS/Godot');
-      } else {
-        this.godotPath = normalize('/usr/bin/godot');
-      }
-
-      this.logDebug(`Using default path: ${this.godotPath}, but this may not work.`);
-      console.error(`[SERVER] Using default path: ${this.godotPath}, but this may not work.`);
-      console.error(`[SERVER] This fallback behavior will be removed in a future version. Set strictPathValidation: true to opt-in to the new behavior.`);
     }
   }
 
@@ -350,16 +379,16 @@ export class GodotServer {
       return false;
     }
 
-    // Normalize the path to ensure consistent format across platforms
-    // (e.g., backslashes to forward slashes on Windows, resolving relative paths)
-    const normalizedPath = normalize(customPath);
-    if (await this.isValidGodotPath(normalizedPath)) {
-      this.godotPath = normalizedPath;
-      this.logDebug(`Godot path set to: ${normalizedPath}`);
+    // Expand ~ and resolve relative paths, then try the platform-specific
+    // executable candidates (Windows .exe suffix, macOS .app bundle).
+    const match = await this.resolveGodotCandidate(customPath);
+    if (match) {
+      this.godotPath = match;
+      this.logDebug(`Godot path set to: ${match}`);
       return true;
     }
 
-    this.logDebug(`Failed to set invalid Godot path: ${normalizedPath}`);
+    this.logDebug(`Failed to set invalid Godot path: ${customPath}`);
     return false;
   }
 
@@ -620,10 +649,15 @@ export class GodotServer {
     argsFn: (a: any) => { projectPath: string; params: OperationParams }
   ): Promise<any> {
     args = normalizeParameters(args || {});
-    const { projectPath, params } = argsFn(args);
+    let { projectPath, params } = argsFn(args);
 
     if (!projectPath) return createErrorResponse('projectPath is required.');
     if (!validatePath(projectPath)) return createErrorResponse('Invalid path.');
+
+    // Resolve ~ and relative paths before checking existence, so a path like
+    // ~/MyProject is checked against the real directory instead of a literal
+    // "~" child directory that never exists.
+    projectPath = resolveUserPath(projectPath);
 
     const projectFile = join(projectPath, 'project.godot');
     if (!existsSync(projectFile)) return createErrorResponse(`Not a valid Godot project: ${projectPath}`);
@@ -656,6 +690,10 @@ export class GodotServer {
     const snakeCaseParams = convertCamelToSnakeCase(params);
     this.logDebug(`Converted snake_case params: ${JSON.stringify(snakeCaseParams)}`);
 
+    // Expand ~ and resolve relative paths so the path reaching the subprocess
+    // is always an absolute, OS-native path, regardless of what the caller's
+    // own pre-checks already did with the raw string.
+    const resolvedProjectPath = resolveUserPath(projectPath);
 
     // Ensure godotPath is set
     if (!this.godotPath) {
@@ -669,26 +707,26 @@ export class GodotServer {
       // Serialize the snake_case parameters to a valid JSON string
       const paramsJson = JSON.stringify(snakeCaseParams);
 
-      // Build argument array for execFile to prevent command injection
-      // Using execFile with argument arrays avoids shell interpretation entirely
-      const args = [
-        '--headless',
-        '--path',
-        projectPath,  // Safe: passed as argument, not interpolated into shell command
-        '--script',
-        this.operationsScriptPath,
+      // Build the argv array for execFile/spawn: every element (including the
+      // project path and the JSON params string) is passed as its own array
+      // entry, never joined into a shell command string. This is what keeps
+      // spaces, CJK characters, Windows backslashes, and the quotes/newlines
+      // inside paramsJson intact - there is no shell to mis-tokenize them and
+      // no need to escape them ourselves.
+      const args = buildGodotOperationArgs({
+        projectPath: resolvedProjectPath,
+        operationsScriptPath: this.operationsScriptPath,
         operation,
-        paramsJson,  // Safe: passed as argument, not interpreted by shell
-      ];
+        paramsJson,
+        debug: GODOT_DEBUG_MODE,
+      });
 
-      
-      if (GODOT_DEBUG_MODE) {
-        args.push('--debug-godot');
-      }
+      this.logDebug(`Executing: ${this.godotPath} ${JSON.stringify(args)}`);
 
-      this.logDebug(`Executing: ${this.godotPath} ${args.join(' ')}`);
-
-      const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
+      // encoding: 'utf8' is explicit (rather than relying on Node's default)
+      // so stdout/stderr always decode as UTF-8 text, keeping CJK paths and
+      // messages readable regardless of the host's default system codepage.
+      const { stdout, stderr } = await execFileAsync(this.godotPath!, args, { encoding: 'utf8' });
 
       return { stdout: stdout ?? '', stderr: stderr ?? '' };
     } catch (error: unknown) {
@@ -3700,16 +3738,19 @@ export class GodotServer {
         }
       }
 
+      // Resolve ~ and relative paths before touching the filesystem or spawn.
+      const projectPath = resolveUserPath(args.projectPath);
+
       // Check if the project directory exists and contains a project.godot file
-      const projectFile = join(args.projectPath, 'project.godot');
+      const projectFile = join(projectPath, 'project.godot');
       if (!existsSync(projectFile)) {
         return createErrorResponse(
-          `Not a valid Godot project: ${args.projectPath}`
+          `Not a valid Godot project: ${projectPath}`
         );
       }
 
-      this.logDebug(`Launching Godot editor for project: ${args.projectPath}`);
-      const process = spawn(this.godotPath, ['-e', '--path', args.projectPath], {
+      this.logDebug(`Launching Godot editor for project: ${projectPath}`);
+      const process = spawn(this.godotPath, ['-e', '--path', projectPath], {
         stdio: 'pipe',
       });
 
@@ -3721,7 +3762,7 @@ export class GodotServer {
         content: [
           {
             type: 'text',
-            text: `Godot editor launched successfully for project at ${args.projectPath}.`,
+            text: `Godot editor launched successfully for project at ${projectPath}.`,
           },
         ],
       };
@@ -3752,6 +3793,11 @@ export class GodotServer {
         'Invalid project path'
       );
     }
+
+    // Resolve ~ and relative paths before the allowed-roots check: resolve()
+    // alone does not expand a leading ~, which would otherwise be compared
+    // against the allowed roots as a literal "~" subdirectory.
+    args.projectPath = resolveUserPath(args.projectPath);
 
     if (!isPathWithinAllowedRoots(args.projectPath, ALLOWED_PROJECT_ROOTS)) {
       return createErrorResponse(
@@ -5233,6 +5279,10 @@ export class GodotServer {
       return createErrorResponse('projectPath and projectName are required.');
     if (!validatePath(args.projectPath))
       return createErrorResponse('Invalid path.');
+    // Resolve ~ and relative paths; existence is intentionally NOT required
+    // here, since create_project's whole job is to populate a path that may
+    // not exist yet.
+    args.projectPath = resolveUserPath(args.projectPath);
     try {
       if (!existsSync(args.projectPath)) {
         mkdirSync(args.projectPath, { recursive: true });

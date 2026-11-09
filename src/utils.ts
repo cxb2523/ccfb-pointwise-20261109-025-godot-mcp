@@ -3,9 +3,64 @@
  * Pure functions extracted for testability.
  */
 
+import { homedir } from 'os';
+import { basename as pathBasename, join as pathJoin, resolve as pathResolve } from 'path';
+
 export interface OperationParams {
   [key: string]: any;
 }
+
+/**
+ * Expand a leading `~` (or `~/`, `~\`) to the user's home directory.
+ * `home` is injectable so this stays pure/testable without touching the real OS.
+ */
+export function expandHomePath(inputPath: string, home: string = homedir()): string {
+  if (!inputPath) return inputPath;
+  if (inputPath === '~') return home;
+  if (inputPath.startsWith('~/') || inputPath.startsWith('~\\')) {
+    return pathJoin(home, inputPath.slice(2));
+  }
+  return inputPath;
+}
+
+/**
+ * Normalize a user-supplied project/executable path for safe use as a single
+ * argv element: expand `~`, then resolve relative paths against cwd. This is
+ * normalization only - it does not check whether the path exists, since some
+ * callers (e.g. create_project) must accept a path that doesn't exist yet.
+ */
+export function resolveUserPath(inputPath: string, home: string = homedir()): string {
+  return pathResolve(expandHomePath(inputPath, home));
+}
+
+/**
+ * Windows executable candidates for a user- or auto-detect-supplied Godot path.
+ * Allows a path without the `.exe` suffix to still resolve.
+ */
+export function buildWindowsGodotCandidates(userPath: string): string[] {
+  if (/\.exe$/i.test(userPath)) return [userPath];
+  return [userPath, `${userPath}.exe`];
+}
+
+/**
+ * macOS executable candidates: prefer drilling into a `.app` bundle's
+ * Contents/MacOS/<AppName>, fall back to Contents/MacOS/Godot, then to the
+ * bare path itself (covers a user pointing directly at the binary).
+ */
+export function buildMacGodotCandidates(userPath: string): string[] {
+  const trimmed = userPath.replace(/[\\/]+$/, '');
+  if (/\.app$/i.test(trimmed)) {
+    const appName = pathBasename(trimmed).replace(/\.app$/i, '');
+    const candidates = [pathJoin(trimmed, 'Contents', 'MacOS', appName)];
+    if (appName !== 'Godot') candidates.push(pathJoin(trimmed, 'Contents', 'MacOS', 'Godot'));
+    candidates.push(trimmed);
+    return candidates;
+  }
+  return [trimmed];
+}
+
+/** Linux bare executable names to try, in priority order. */
+export const LINUX_GODOT_BINARY_NAMES: readonly string[] = ['godot4', 'godot', 'Godot_v4'];
 
 export const PARAMETER_MAPPINGS: Record<string, string> = {
   'project_path': 'projectPath',
@@ -262,6 +317,34 @@ export function parseGodotScriptDiagnostics(output: string): ScriptDiagnostic[] 
     diagnostics.push({ message, ...(file ? { file } : {}), ...(line !== undefined ? { line } : {}) });
   }
   return diagnostics;
+}
+
+export interface GodotOperationArgsOptions {
+  projectPath: string;
+  operationsScriptPath: string;
+  operation: string;
+  paramsJson: string;
+  debug?: boolean;
+}
+
+/**
+ * Build the argv array passed to the Godot binary for a headless operation.
+ * Each element is handed to child_process as its own array entry (no shell),
+ * so paths with spaces/CJK characters and JSON strings with embedded quotes
+ * or newlines reach Godot's argv unmodified instead of being shell-escaped.
+ */
+export function buildGodotOperationArgs(opts: GodotOperationArgsOptions): string[] {
+  const args = [
+    '--headless',
+    '--path',
+    opts.projectPath,
+    '--script',
+    opts.operationsScriptPath,
+    opts.operation,
+    opts.paramsJson,
+  ];
+  if (opts.debug) args.push('--debug-godot');
+  return args;
 }
 
 export function collectGdPaths(outputs: string[]): string[] {

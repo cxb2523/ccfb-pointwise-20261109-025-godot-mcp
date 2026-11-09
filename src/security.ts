@@ -1,8 +1,12 @@
 import { existsSync, realpathSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
+import { expandHomePath } from './utils.js';
 
 export function canonicalPath(target: string): string {
-  let ancestor = resolve(target);
+  // Expand ~ before resolve(): resolve() treats a leading ~ as a literal
+  // directory name, which would make a path like "~/MyProject" compare as
+  // being outside every real allowed root instead of inside the home dir.
+  let ancestor = resolve(expandHomePath(target));
   const suffix: string[] = [];
   while (!existsSync(ancestor)) {
     const parent = dirname(ancestor);
